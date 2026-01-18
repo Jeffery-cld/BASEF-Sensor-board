@@ -1,0 +1,153 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_MLX90614.h>
+#include <SoftwareSerial.h>
+
+MAX30105 particleSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+SoftwareSerial link(9, 8); // RX unused, TX=D8 -> Arduino #2 D2
+
+const byte RATE_SIZE = 8;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+
+long lastBeatMs = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+bool fingerPresent = false;
+
+unsigned long lastTempMs = 0;
+unsigned long lastStatusMs = 0;
+const unsigned long TEMP_INTERVAL_MS = 500;
+const unsigned long STATUS_INTERVAL_MS = 250;
+
+float Ta = NAN;
+float To = NAN;
+
+uint8_t mlxFailCount = 0;
+
+int avgRates() {
+  int sum = 0;
+  for (byte i = 0; i < RATE_SIZE; i++) sum += rates[i];
+  return sum / RATE_SIZE;
+}
+
+void setup() {
+  Serial.begin(115200);
+  link.begin(9600);
+  delay(300);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  Serial.println("=== Arduino #1 Sensors Start ===");
+
+  Serial.print("MLX90614 init... ");
+  if (!mlx.begin()) Serial.println("FAILED");
+  else Serial.println("OK");
+
+  Serial.print("MAX30102 init... ");
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("FAILED");
+    while (1) delay(10);
+  }
+  Serial.println("OK");
+
+  // ---- LOWER POWER SETTINGS (helps MLX stability) ----
+  byte ledBrightness = 20;   // was 80
+  byte sampleAverage = 4;
+  byte ledMode = 2;
+  int sampleRate = 100;
+  int pulseWidth = 411;
+  int adcRange = 16384;
+
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode,
+                       sampleRate, pulseWidth, adcRange);
+
+  // Lower amplitude
+  particleSensor.setPulseAmplitudeRed(0x10);
+  particleSensor.setPulseAmplitudeIR(0x10);
+
+  // Re-lock I2C speed after sensor setup
+  Wire.setClock(100000);
+
+  for (byte i = 0; i < RATE_SIZE; i++) rates[i] = 0;
+}
+
+void loop() {
+  long irValue = particleSensor.getIR();
+  fingerPresent = (irValue > 8000);
+
+  if (fingerPresent && checkForBeat(irValue)) {
+    long now = millis();
+    long delta = now - lastBeatMs;
+    lastBeatMs = now;
+    if (delta > 0) {
+      beatsPerMinute = 60.0 / (delta / 1000.0);
+      if (beatsPerMinute > 30 && beatsPerMinute < 200) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = avgRates();
+      }
+    }
+  } else if (!fingerPresent) {
+    beatsPerMinute = 0;
+    beatAvg = 0;
+  }
+
+  unsigned long nowMs = millis();
+
+  // ---- MLX reads with retry ----
+  if (nowMs - lastTempMs >= TEMP_INTERVAL_MS) {
+    lastTempMs = nowMs;
+
+    Wire.setClock(100000); 
+
+    float newTa = mlx.readAmbientTempC();
+    float newTo = mlx.readObjectTempC();
+
+    if (!isnan(newTa) && !isnan(newTo)) {
+      Ta = newTa;
+      To = newTo;
+      mlxFailCount = 0;
+    } else {
+      mlxFailCount++;
+      if (mlxFailCount >= 5) {
+        mlx.begin();
+        Wire.setClock(100000);
+        mlxFailCount = 0;
+      }
+    }
+  }
+
+  if (nowMs - lastStatusMs >= STATUS_INTERVAL_MS) {
+    lastStatusMs = nowMs;
+
+    // USB debug
+    Serial.print("IR="); Serial.print(irValue);
+    Serial.print(" Finger="); Serial.print(fingerPresent ? "YES" : "NO");
+    Serial.print(" BPM="); Serial.print(beatsPerMinute, 1);
+    Serial.print(" Avg="); Serial.print(beatAvg);
+    Serial.print(" Ta="); Serial.print(Ta, 2);
+    Serial.print(" To="); Serial.println(To, 2);
+
+    // Link packet (integers)
+    int bpm10 = (int)(beatsPerMinute * 10.0 + 0.5);
+    int Ta100 = isnan(Ta) ? -1 : (int)(Ta * 100.0 + 0.5);
+    int To100 = isnan(To) ? -1 : (int)(To * 100.0 + 0.5);
+
+    link.print("S,");
+    link.print(fingerPresent ? 1 : 0);
+    link.print(",");
+    link.print(bpm10);
+    link.print(",");
+    link.print(beatAvg);
+    link.print(",");
+    link.print(Ta100);
+    link.print(",");
+    link.println(To100);
+  }
+
+  delay(5);
+}
