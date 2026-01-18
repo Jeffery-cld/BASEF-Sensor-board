@@ -1,0 +1,323 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <SoftwareSerial.h>
+
+const int OLED_RES = 4;
+const uint8_t OLED_ADDR = 0x3C;
+
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C oled(U8G2_R0, OLED_RES, U8X8_PIN_NONE);
+SoftwareSerial link(2, 3); // RX=D2, TX unused
+
+// Incoming values 
+// Packet: S,<finger>,<bpm10>,<avg>,<Ta100>,<To100>
+bool finger = false;
+int bpm10 = 0;
+int avgBpm = 0;
+int Ta100 = -1;
+int To100 = -1;
+
+unsigned long lastPacketMs = 0;
+const unsigned long PACKET_TIMEOUT_MS = 1500;
+
+unsigned long lastDrawMs = 0;
+const unsigned long DRAW_INTERVAL_MS = 200;
+
+char lineBuf[80];
+uint8_t pos = 0;
+char lastRaw[40] = "none"; 
+
+// the calming feaature 
+
+const int HR_HIGH_BPM = 100;               
+const int HR_CLEAR_BPM = 95;               
+const unsigned long HOLD_MS = 90000UL;       
+const unsigned long CALM_TOTAL_MS = 60000UL; 
+
+// Breathing pattern: 4 in / 6 out (10s cycle = 6 breaths/min)
+const unsigned long IN_MS = 4000UL;
+const unsigned long OUT_MS = 6000UL;
+const unsigned long CYCLE_MS = IN_MS + OUT_MS;
+
+bool calmMode = false;
+unsigned long highSinceMs = 0;
+unsigned long calmStartMs = 0;
+
+// cooldown after calm so it doesn't immediately re-trigger
+const unsigned long COOLDOWN_MS = 120000UL;  
+unsigned long cooldownUntilMs = 0;
+
+// HELPERS 
+bool parseIntPacket(char *line) {
+  // Expected: S,<finger>,<bpm10>,<avg>,<Ta100>,<To100>
+  if (!(line[0] == 'S' && line[1] == ',')) return false;
+
+  char* tok[6] = {0};
+  int t = 0;
+  tok[t++] = line;
+
+  for (char* p = line; *p && t < 6; p++) {
+    if (*p == ',') {
+      *p = '\0';
+      tok[t++] = p + 1;
+    }
+  }
+  if (t < 6) return false;
+
+  finger = (atoi(tok[1]) == 1);
+  bpm10  = atoi(tok[2]);
+  avgBpm = atoi(tok[3]);
+  Ta100  = atoi(tok[4]);
+  To100  = atoi(tok[5]);
+
+  return true;
+}
+
+bool signalOk() {
+  return (millis() - lastPacketMs) <= PACKET_TIMEOUT_MS;
+}
+
+bool isSustainedHigh() {
+  // "High timer running" means we're counting toward trigger
+  return (highSinceMs != 0) && !calmMode;
+}
+
+void updateCalmLogic() {
+  unsigned long now = millis();
+
+  // If no signal or no finger, reset calm logic
+  if (!signalOk() || !finger) {
+    calmMode = false;
+    highSinceMs = 0;
+    return;
+  }
+
+  // If in cooldown, do not start trigger timing
+  if (!calmMode && now < cooldownUntilMs) {
+    highSinceMs = 0;
+    return;
+  }
+
+  int hr = avgBpm; // stable value
+
+  if (!calmMode) {
+    if (hr >= HR_HIGH_BPM) {
+      if (highSinceMs == 0) highSinceMs = now;
+
+      if (now - highSinceMs >= HOLD_MS) {
+        calmMode = true;
+        calmStartMs = now;
+        highSinceMs = 0; // reset since we're now in calm mode
+      }
+    } else {
+      highSinceMs = 0;
+    }
+  } else {
+    // Exit calm after 1 minute or early if HR drops
+    if (now - calmStartMs >= CALM_TOTAL_MS) {
+      calmMode = false;
+      cooldownUntilMs = now + COOLDOWN_MS;
+    } else if (hr <= HR_CLEAR_BPM) {
+      calmMode = false;
+      cooldownUntilMs = now + COOLDOWN_MS;
+    }
+  }
+}
+
+void drawBreathBar(float pct) {
+  pct = constrain(pct, 0.0f, 1.0f);
+  int x = 0, y = 58, w = 128, h = 6;
+  oled.drawFrame(x, y, w, h);
+  int fill = (int)((w - 2) * pct);
+  oled.drawBox(x + 1, y + 1, fill, h - 2);
+}
+
+// Screen 
+void drawNoSignal() {
+  oled.firstPage();
+  do {
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 8, "Arduino #2 OLED");
+
+    oled.setFont(u8g2_font_ncenB10_tr);
+    oled.drawStr(0, 28, "NO SIGNAL");
+
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 40, "Listening D2 @9600");
+    oled.drawStr(0, 52, "Last line:");
+    oled.drawStr(0, 62, lastRaw);
+  } while (oled.nextPage());
+}
+
+void drawWarningScreen() {
+  // This screen shows while the sustained-high timer is running
+  unsigned long elapsedS = (millis() - highSinceMs) / 1000UL;
+  unsigned long needS = HOLD_MS / 1000UL;
+
+  oled.firstPage();
+  do {
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 8, "Arousal Detected");
+
+    oled.setFont(u8g2_font_ncenB10_tr);
+    oled.drawStr(0, 28, "BPM TOO HIGH");
+
+    oled.setFont(u8g2_font_6x10_tr);
+    oled.drawStr(0, 44, "Please slow down &");
+    oled.drawStr(0, 56, "try calm breathing.");
+
+    // small progress indicator (seconds)
+    oled.setFont(u8g2_font_5x7_tr);
+    char p[28];
+    sprintf(p, "%lus/%lus", elapsedS, needS);
+    oled.drawStr(90, 8, p);
+
+  } while (oled.nextPage());
+}
+
+void drawNormalScreen() {
+  oled.firstPage();
+  do {
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 8, "Arduino #2 OLED");
+
+    oled.setFont(u8g2_font_6x10_tr);
+    oled.drawStr(0, 22, finger ? "Finger: YES" : "Finger: NO");
+
+    oled.setFont(u8g2_font_ncenB12_tr);
+    char s1[22];
+    int w = bpm10 / 10;
+    int f = abs(bpm10 % 10);
+    sprintf(s1, "BPM: %d.%d", w, f);
+    oled.drawStr(0, 42, s1);
+
+    oled.setFont(u8g2_font_6x10_tr);
+    char s2[22];
+    sprintf(s2, "Avg: %d", avgBpm);
+    oled.drawStr(0, 56, s2);
+
+    char t1[22];
+    if (To100 < 0) strcpy(t1, "To: --.--C");
+    else {
+      int tw = To100 / 100;
+      int tf = abs(To100 % 100);
+      sprintf(t1, "To:%d.%02dC", tw, tf);
+    }
+    oled.drawStr(70, 56, t1);
+
+  } while (oled.nextPage());
+}
+
+void drawCalmScreen() {
+  unsigned long now = millis();
+  unsigned long t = now - calmStartMs;
+  if (t >= CALM_TOTAL_MS) return;
+
+  unsigned long m = t % CYCLE_MS;
+  const char* phase;
+  float pct;
+
+  if (m < IN_MS) {
+    phase = "BREATHE IN";
+    pct = (float)m / (float)IN_MS;
+  } else {
+    phase = "BREATHE OUT";
+    unsigned long x = m - IN_MS;
+    pct = 1.0f - (float)x / (float)OUT_MS;
+  }
+
+  unsigned long leftS = (CALM_TOTAL_MS - t) / 1000UL;
+
+  oled.firstPage();
+  do {
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 8, "Calm Guide (optional)");
+
+    oled.setFont(u8g2_font_ncenB10_tr);
+    oled.drawStr(0, 30, phase);
+
+    oled.setFont(u8g2_font_6x10_tr);
+    char buf[28];
+    sprintf(buf, "HR(avg): %d bpm", avgBpm);
+    oled.drawStr(0, 46, buf);
+
+    sprintf(buf, "%lus left", leftS);
+    oled.drawStr(92, 8, buf);
+
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 56, "4s IN / 6s OUT");
+
+    drawBreathBar(pct);
+
+  } while (oled.nextPage());
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  pinMode(13, OUTPUT);
+  digitalWrite(13, LOW);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  oled.setI2CAddress(OLED_ADDR << 1);
+  oled.begin();
+
+  link.begin(9600);
+
+  oled.firstPage();
+  do {
+    oled.setFont(u8g2_font_ncenB10_tr);
+    oled.drawStr(0, 18, "OLED Ready (0x3C)");
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 36, "Waiting packets on D2");
+  } while (oled.nextPage());
+}
+
+void loop() {
+  // ----- Read packets -----
+  while (link.available()) {
+    digitalWrite(13, HIGH);
+
+    char c = (char)link.read();
+
+    // treat BOTH newline and carriage return as end
+    if (c == '\n' || c == '\r') {
+      if (pos > 0) {
+        lineBuf[pos] = '\0';
+        pos = 0;
+
+        strncpy(lastRaw, lineBuf, sizeof(lastRaw)-1);
+        lastRaw[sizeof(lastRaw)-1] = '\0';
+
+        if (parseIntPacket(lineBuf)) {
+          lastPacketMs = millis();
+        }
+      }
+    } else {
+      if (pos < sizeof(lineBuf) - 1) lineBuf[pos++] = c;
+      else pos = 0;
+    }
+
+    digitalWrite(13, LOW);
+  }
+
+  // ----- Calm logic -----
+  updateCalmLogic();
+
+  // ----- Draw -----
+  unsigned long now = millis();
+  if (now - lastDrawMs >= DRAW_INTERVAL_MS) {
+    lastDrawMs = now;
+
+    if (!signalOk()) {
+      drawNoSignal();
+    } else if (calmMode) {
+      drawCalmScreen();
+    } else if (isSustainedHigh()) {
+      // NEW: show warning while sustained timer is running
+      drawWarningScreen();
+    } else {
+      drawNormalScreen();
+    }
+  }
+}
